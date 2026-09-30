@@ -1,0 +1,13 @@
+configs/devices/arm-softmmu/default.mak
+.gitattributes
+.gitignore
+hw/arm/Kconfig
+hw/arm/meson.build
+hw/char/meson.build
+hw/intc/meson.build
+hw/ssi/meson.build
+hw/timer/meson.build
+LICENSE
+meson.build
+meson_options.txt
+scripts/meson-buildoptions.sh

@@ -1,0 +1,234 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * calypso_dcch_tap.c - quel canal dedie le mobile utilise, pour le pont.
+ *
+ * pont.py ne lit pas lui-meme les IMMEDIATE ASSIGNMENT : sa classe Dedicated
+ * (pont/state.py) attend qu'on lui dise le canal dans
+ * /dev/shm/calypso_dcch_cfg, et tant que ce fichier n'existe pas,
+ * uplink.py:_poll_sdcch() jette tous les blocs montants -- y compris le SABM
+ * qui porte la LOCATION UPDATING REQUEST.
+ *
+ * En montage gr-gsm c'est l1-grgsm/calypso_l1ctl_tap.c qui l'ecrit, branche
+ * par la vtable de la couche 1 (uart_tx_byte). Sous CALYPSO_DSP_EXTERN=1
+ * cette couche 1 est desactivee (calypso_l1_disable), donc plus personne ne
+ * l'ecrivait : mesure du 2026-09-21, le bloc SABM etait bien capture par
+ * c54x_exe (src/montant.c) et publie dans /dev/shm/calypso_sdcch_ul, mais le
+ * pont ne l'emettait jamais.
+ *
+ * Ce tap-ci ne depend d'aucune couche 1 : il renifle le flux sercomm que le
+ * firmware envoie a osmocon et n'en retient que le numero de canal des
+ * L1CTL_DATA_CONF / DATA_IND. Il ne publie que le side-band ; les reactions
+ * propres a la couche 1 gr-gsm (fenetre a_cd, garde DCCH) restent chez elle.
+ */
+#include "qemu/osdep.h"
+#include "qemu/bswap.h"
+#include "hw/arm/calypso/calypso_dcch_tap.h"
+#include "hw/arm/calypso/calypso_trx.h"
+#include <fcntl.h>
+#include <unistd.h>
+
+#define SERCOMM_FLAG        0x7E
+#define SERCOMM_ESCAPE      0x7D
+#define SERCOMM_ESCAPE_XOR  0x20
+#define SERCOMM_DLCI_L1CTL  5
+
+#define L1CTL_DATA_IND      0x03
+#define L1CTL_RACH_CONF     0x0c
+#define L1CTL_DATA_CONF     0x0f
+
+#define SHM_DCCH_CFG        "/dev/shm/calypso_dcch_cfg"
+#define DCCH_RELEASED       0xFF
+
+/* Combien de trames doivent separer le dernier bloc du canal dedie d'un bloc
+ * sur une voie commune avant de conclure que le canal est libere. Un bloc CCCH
+ * en retard, delivre juste apres la bascule, porte un numero de trame proche
+ * de ceux du canal dedie : il ne doit pas liberer quoi que ce soit. */
+#define DCCH_LIBERE_APRES_TRAMES  100
+
+static struct {
+    enum { SC_IDLE, SC_IN_FRAME, SC_ESCAPE } state;
+    uint8_t buf[512];
+    int len;
+    uint8_t dernier_chan_nr;
+    uint32_t seq;
+    uint32_t fn_dedie;       /* derniere trame vue sur le canal dedie */
+    bool     fn_dedie_vue;
+    uint8_t  trx_chan_nr;    /* dernier SDCCH (ou 0xFF) dit a calypso_trx */
+} tap = { .dernier_chan_nr = 0xFF, .trx_chan_nr = 0xFF };
+
+/* [2026-09-23] Genres du TCH. Les lecteurs qui ne connaissaient que 0/1/0xFF
+ * (montant.c scruter_dcch, pont/dsp/dedicated.py) ont ete adaptes ; pont.py
+ * grgsm ne lit jamais ce tap (sa couche 1 ecrit le fichier elle-meme). */
+#define DCCH_TCH_F          2
+#define DCCH_TCH_H          3
+
+/* 16 octets, comme les attend pont/state.py:Dedicated.read() :
+ * seq(4) kind(1) ss(1) tn(1) chan_nr(1). kind 0 = SDCCH/4, 1 = SDCCH/8,
+ * 2 = TCH/F, 3 = TCH/H (ss = demi-debit), 0xFF = canal libere. */
+static void dcch_cfg_publier(int kind, int ss, uint8_t chan_nr)
+{
+    uint8_t b[16] = {0};
+    tap.seq++;
+    memcpy(b, &tap.seq, 4);
+    b[4] = (uint8_t)kind;
+    b[5] = (uint8_t)ss;
+    b[6] = chan_nr & 0x07;
+    b[7] = chan_nr;
+    int fd = open(SHM_DCCH_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        return;
+    }
+    if (write(fd, b, sizeof(b)) < 0) {
+        close(fd);
+        return;
+    }
+    close(fd);
+    /* [2026-09-23] calypso_trx (PONT_DCCH -> pont.c -> calypso_bsp_set_dedie)
+     * n'entend que ce qu'il entendait avant : un SDCCH nouveau ou la
+     * liberation. Le TCH ne lui est pas dit -- la bascule du BSP sur le TCH
+     * est l'affaire de montant.c (suivre_tache_tch), qu'un PONT_DCCH genre 2
+     * court-circuiterait -- et le retour sur le MEME SDCCH apres le TCH
+     * (ASSIGNMENT FAILURE) non plus, comme quand le tap ignorait le TCH. */
+    if (kind != DCCH_TCH_F && kind != DCCH_TCH_H && chan_nr != tap.trx_chan_nr) {
+        tap.trx_chan_nr = kind == DCCH_RELEASED ? 0xFF : chan_nr;
+        calypso_trx_dcch(kind, ss, chan_nr & 0x07);
+    }
+    if (kind == DCCH_TCH_F || kind == DCCH_TCH_H) {
+        fprintf(stderr, "[dcch] canal dedie arme : chan_nr=0x%02x TCH/%c SS=%d TN=%d\n",
+                chan_nr, kind == DCCH_TCH_F ? 'F' : 'H', ss, chan_nr & 7);
+        return;
+    }
+    fprintf(stderr, "[dcch] canal dedie %s : chan_nr=0x%02x SDCCH/%d SS=%d TN=%d\n",
+            kind == DCCH_RELEASED ? "libere" : "arme", chan_nr,
+            kind == 1 ? 8 : 4, ss, chan_nr & 7);
+}
+
+static void trame_complete(void)
+{
+    if (tap.len < 3 || tap.buf[0] != SERCOMM_DLCI_L1CTL) {
+        return;
+    }
+    const uint8_t *charge = &tap.buf[2];
+    int plen = tap.len - 2;
+    uint8_t type = charge[0];
+    if (type == L1CTL_RACH_CONF && plen >= 12) {
+        /* La trame d'emission du RACH, telle que le firmware la remonte. */
+        calypso_trx_rach_conf(ldl_be_p(charge + 8));
+        return;
+    }
+    if ((type != L1CTL_DATA_CONF && type != L1CTL_DATA_IND) || plen < 5) {
+        return;
+    }
+    /* chan_nr, 44.004 8.3 : 0b001SSTTT = SDCCH/4, 0b01SSSTTT = SDCCH/8,
+     * 0b00001TTT = TCH/F, 0b0001STTT = TCH/H.
+     *
+     * [2026-09-23] LE TCH EST UN CANAL DEDIE COMME UN AUTRE. Le tap ne
+     * reconnaissait que le SDCCH : a l'assignation (DM_EST_REQ chan_nr=0x0a,
+     * TCH/F TS2), les DATA_IND/CONF de la FACCH et de la SACCH/T portent 0x0a,
+     * classe « ni dedie ni commun », ignore. calypso_dcch_cfg annoncait donc
+     * SDCCH/8 TS1 pendant tout l'appel. Il annonce maintenant le TCH (genre
+     * 2/3) ; le SDCCH quitte n'est pas « libere » (0xFF reste la fin de la
+     * connexion : pont/dsp/uplink.py _poll_release, montant.c) et les
+     * lecteurs le gardent en memoire pour l'ASSIGNMENT FAILURE, ou le
+     * firmware y revient et ou le tap le republie (chan_nr change). */
+    uint8_t chan_nr = charge[4];
+    int kind = -1, ss = 0;
+    if ((chan_nr & 0xE0) == 0x20) {
+        kind = 0;
+        ss = (chan_nr >> 3) & 0x03;
+    } else if ((chan_nr & 0xC0) == 0x40) {
+        kind = 1;
+        ss = (chan_nr >> 3) & 0x07;
+    } else if ((chan_nr & 0xF8) == 0x08) {
+        kind = DCCH_TCH_F;
+    } else if ((chan_nr & 0xF0) == 0x10) {
+        kind = DCCH_TCH_H;
+        ss = (chan_nr >> 3) & 0x01;
+    }
+    uint32_t fn = (plen >= 12) ? ldl_be_p(charge + 8) : 0;
+    if (kind >= 0) {
+        tap.fn_dedie = fn;
+        tap.fn_dedie_vue = true;
+        if (chan_nr != tap.dernier_chan_nr) {
+            tap.dernier_chan_nr = chan_nr;
+            dcch_cfg_publier(kind, ss, chan_nr);
+        }
+        return;
+    }
+    /* [2026-09-21] LA LIBERATION SE LIT ICI, pas sur d_dsp_page.
+     *
+     * Premiere version : publier « libere » quand le firmware remet
+     * d_dsp_page a 0, comme le l1_reset() de la couche 1 gr-gsm. Faux : le
+     * firmware fait justement un l1s_dsp_abort() (sync.c:308) au moment ou il
+     * bascule vers le canal dedie -- « resetting scheduler » dans le journal
+     * du mobile, juste apres l'IMMEDIATE ASSIGNMENT. On annoncait donc
+     * « arme » puis « libere » dans la seconde, pont.py voyait un canal
+     * libere, et jetait le SABM : lchan en WAIT_RLL_RTP_ESTABLISH puis
+     * Timeout. Avant que le SABM ne soit publie une seule fois, le defaut
+     * etait masque, une republication finissait par tomber dans une fenetre
+     * ou le canal etait arme.
+     *
+     * Signal juste : un bloc recu ou emis sur un canal NON dedie (BCCH, CCCH)
+     * veut dire que le mobile est revenu sur les voies communes. En mode
+     * dedie il n'en lit aucun, donc ca ne peut pas arriver au milieu d'une
+     * connexion. */
+    /* Et seulement pour un VRAI canal commun : 44.004 8.3 donne 0x80 BCCH,
+     * 0x88 RACH, 0x90 PCH/AGCH. Un chan_nr de 0x00 n'est pas un canal, et
+     * c'est pourtant ce qu'on voyait passer -- releve du 2026-09-21 :
+     * « arme » et « libere » en alternance des dizaines de fois par seconde
+     * pendant la connexion, le BSP basculant entre TS0 et TS1 a chaque bloc,
+     * donc aucune descente dediee decodable. */
+    if (tap.dernier_chan_nr != 0xFF && (chan_nr & 0xE0) == 0x80) {
+        /* [2026-09-21] Et pas au premier bloc CCCH venu : la couche 1 en
+         * delivre encore un ou deux juste apres la bascule vers le canal
+         * dedie. Liberer la, c'est couper la descente dediee en plein
+         * etablissement -- mesure : tous les blocs a 110/98/87 erreurs
+         * jusqu'au MDL-ERROR-IND, aucun UA. On exige donc que le bloc commun
+         * soit nettement POSTERIEUR au dernier bloc du canal dedie. */
+        uint32_t ecart = tap.fn_dedie_vue ? ((fn - tap.fn_dedie) % 2715648u) : 0xFFFFFFFFu;
+        if (!tap.fn_dedie_vue || (ecart >= DCCH_LIBERE_APRES_TRAMES && ecart < 2715648u / 2)) {
+            tap.dernier_chan_nr = 0xFF;
+            tap.fn_dedie_vue = false;
+            dcch_cfg_publier(DCCH_RELEASED, 0, 0);
+        }
+    }
+}
+
+void calypso_dcch_tap_tx_byte(uint8_t byte)
+{
+    switch (tap.state) {
+    case SC_IDLE:
+        if (byte == SERCOMM_FLAG) {
+            tap.state = SC_IN_FRAME;
+            tap.len = 0;
+        }
+        break;
+    case SC_IN_FRAME:
+        if (byte == SERCOMM_FLAG) {
+            if (tap.len > 0) {
+                trame_complete();
+            }
+            tap.len = 0;
+        } else if (byte == SERCOMM_ESCAPE) {
+            tap.state = SC_ESCAPE;
+        } else if (tap.len < (int)sizeof(tap.buf)) {
+            tap.buf[tap.len++] = byte;
+        }
+        break;
+    case SC_ESCAPE:
+        if (tap.len < (int)sizeof(tap.buf)) {
+            tap.buf[tap.len++] = byte ^ SERCOMM_ESCAPE_XOR;
+        }
+        tap.state = SC_IN_FRAME;
+        break;
+    }
+}
+
+void calypso_dcch_tap_reset(void)
+{
+    if (tap.dernier_chan_nr == 0xFF) {
+        return;
+    }
+    tap.dernier_chan_nr = 0xFF;
+    dcch_cfg_publier(DCCH_RELEASED, 0, 0);
+}
